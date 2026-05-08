@@ -7,7 +7,7 @@ Kullanım:
     python pipeline.py --video video.mp4 \
                        --target_language Turkish \
                        --target_language_id tr \
-                       --lm_studio_url http://localhost:1234/v1 \
+                       --lm_studio_url http://localhost:11434/v1 \
                        --translation_api deepl \
                        --translation_api_key YOUR_KEY
 """
@@ -21,7 +21,6 @@ import shutil
 import subprocess
 import sys
 import time
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +40,9 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("dubbing")
+
+# Ortak Python executable yolu (kullanıcı ortamı)
+PYTHON_BIN = "/usr/local/envs/dubbing/bin/python"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,10 +209,8 @@ def step1_separate_audio(video_path: str, tmp: str) -> tuple[str, str]:
     log.info(f"Ham ses çıkarıldı: {raw_audio}")
 
     # Demucs ile kaynak ayrıştırma
-    venv_python = "/mnt/depo_hdd/video_dubbing_Docker/.venv_2404/bin/python"
-    python_exec = venv_python if os.path.exists(venv_python) else sys.executable
     run(
-        f'{q(python_exec)} -m demucs --two-stems=vocals -o {q(tmp + "/demucs")} {q(raw_audio)}',
+        f'{q(PYTHON_BIN)} -m demucs --two-stems=vocals -o {q(tmp + "/demucs")} {q(raw_audio)}',
         "demucs"
     )
 
@@ -302,8 +302,10 @@ def step2_diarize(vocals_path: str, whisper_model: str, tmp: str, source_languag
     log.info("=" * 60)
     log.info(f"ADIM 2 — Diarization & Transcription (Whisper {whisper_model}, dil={source_language})")
 
-    diarize_script = "diarize.py"
-    python_bin = sys.executable
+    diarize_script = Path(__file__).resolve().parent / "diarize.py"
+    python_bin = PYTHON_BIN
+    if not diarize_script.exists():
+        raise RuntimeError(f"diarize.py bulunamadı: {diarize_script}")
     
     cmd = f"{q(python_bin)} {q(diarize_script)} -a {q(vocals_path)} --no-stem --whisper-model {whisper_model} --device cuda"
     if source_language != "auto":
@@ -325,6 +327,76 @@ def step2_diarize(vocals_path: str, whisper_model: str, tmp: str, source_languag
     shutil.copy(srt_out, f"{tmp}/original.srt")
     log.info(f"{len(segments)} segment transkribe edildi ve konuşmacılara ayrıldı.")
     return segments
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADIM 2.5 — KONUŞMACI BLOKLAMA (Speaker Merging)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def step2_5_merge_speakers(segments: list, gap_threshold_ms: int, tmp: str) -> list:
+    """
+    Ardışık aynı konuşmacı segmentlerini birleştirir.
+    
+    Kural: İki ardışık segment aynı konuşmacıya aitse VE aralarındaki
+    boşluk gap_threshold_ms'den küçükse, tek bir blok olarak birleştirilir.
+    
+    Bu sayede OmniVoice TTS'e daha uzun ve doğal metin blokları gönderilir,
+    daha akıcı bir seslendirme elde edilir.
+    """
+    log.info("=" * 60)
+    log.info(f"ADIM 2.5 — Konuşmacı Bloklama (eşik: {gap_threshold_ms}ms)")
+    
+    if not segments:
+        return segments
+    
+    gap_threshold_sec = gap_threshold_ms / 1000.0
+    merged = []
+    current_block = dict(segments[0])  # İlk segmentle başla (kopya)
+    current_block["merged_ids"] = [current_block["id"]]
+    
+    for i in range(1, len(segments)):
+        seg = segments[i]
+        gap = seg["start"] - current_block["end"]
+        same_speaker = seg["speaker"] == current_block["speaker"]
+        
+        if same_speaker and gap <= gap_threshold_sec:
+            # Birleştir: metni ekle, bitiş zamanını güncelle
+            current_block["original_text"] += " " + seg["original_text"]
+            current_block["end"] = seg["end"]
+            current_block["duration"] = round(current_block["end"] - current_block["start"], 3)
+            current_block["merged_ids"].append(seg["id"])
+        else:
+            # Farklı konuşmacı veya boşluk çok büyük → bloğu kapat, yenisini başlat
+            merged.append(current_block)
+            current_block = dict(seg)
+            current_block["merged_ids"] = [seg["id"]]
+    
+    # Son bloğu ekle
+    merged.append(current_block)
+    
+    # ID'leri yeniden numaralandır
+    for i, block in enumerate(merged, 1):
+        block["id"] = i
+    
+    original_count = len(segments)
+    merged_count = len(merged)
+    reduced = original_count - merged_count
+    
+    log.info(f"  Orijinal: {original_count} segment → Birleştirilmiş: {merged_count} blok ({reduced} segment birleştirildi)")
+    
+    # Birleştirilen blokları logla
+    for block in merged:
+        if len(block["merged_ids"]) > 1:
+            ids_str = ", ".join(str(x) for x in block["merged_ids"])
+            log.info(
+                f"  Blok {block['id']}: [{block['speaker']}] "
+                f"{block['start']:.3f}s → {block['end']:.3f}s "
+                f"({block['duration']:.2f}s) — orijinal ID'ler: [{ids_str}]"
+            )
+    
+    save_segments(merged, f"{tmp}/segments.json")
+    write_srt(merged, "original_text", f"{tmp}/original_merged.srt")
+    return merged
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -610,7 +682,7 @@ def step4_translate(
     context_size: int = 2,
 ) -> list:
     log.info("=" * 60)
-    log.info(f"ADIM 4 — Bağlamsal Çeviri (Strateji: {translation_strategy}, Bağlam: {context_size}) (LM Studio -> {target_language})")
+    log.info(f"ADIM 4 — Bağlamsal Çeviri (Strateji: {translation_strategy}, Bağlam: {context_size}) (Ollama/OpenAI API -> {target_language})")
 
     SYSTEM_TRANSLATE_CONTEXT = f"""
 You are a professional subtitle localizer.
@@ -1109,14 +1181,19 @@ def step7_speed_adjust(
     max_speed_factor: float = 1.25,
     max_shortening_ratio: float = 0.40,
     silence_threshold: str = "-40dB",
+    slow_video: bool = False,
 ) -> list:
     """
     TTS süresi segment süresini aşan segmentler için:
-    1. atempo ≤ max_speed_factor → FFmpeg hızlandırma
-    2. atempo > max_speed_factor → OmniVoice duration parametresiyle yeniden üret
+    slow_video=False (varsayılan):
+      1. atempo ≤ max_speed_factor → FFmpeg hızlandırma
+      2. atempo > max_speed_factor → OmniVoice duration parametresiyle yeniden üret
+    slow_video=True:
+      TTS uzun olan segmentlerde sesi hızlandırmak yerine video_slow_factor kaydedilir.
+      step8'de video bu oranda yavaşlatılacak.
     """
     log.info("=" * 60)
-    log.info("ADIM 7 — Hız ayarı")
+    log.info(f"ADIM 7 — Hız ayarı (slow_video={'AÇIK' if slow_video else 'KAPALI'})")
 
     try:
         import soundfile as sf
@@ -1149,11 +1226,27 @@ def step7_speed_adjust(
             continue
 
         if speed_factor < 1.0:
+            # Ses kısa → yavaşlat veya padding ekle (slow_video modu fark etmez)
             log.info(f"Seg {sid}: ses kısa ({tts_dur:.2f}s < {seg_dur:.2f}s), yavaşlatılıyor (speed_factor={speed_factor:.3f})")
             force_omnivoice = speed_factor < max_shortening_ratio
         else:
-            log.info(f"Seg {sid}: ses uzun ({tts_dur:.2f}s > {seg_dur:.2f}s), hızlandırılıyor (speed_factor={speed_factor:.3f})")
-            force_omnivoice = speed_factor > max_speed_factor
+            # Ses uzun → hızlandır VEYA video yavaşlat
+            if slow_video:
+                # ── SLOW VIDEO MODU: sesi olduğu gibi bırak, video_slow_factor kaydet ──
+                log.info(
+                    f"Seg {sid}: ses uzun ({tts_dur:.2f}s > {seg_dur:.2f}s), "
+                    f"video yavaşlatılacak (factor={speed_factor:.3f})"
+                )
+                final_path = f"{tmp}/tts_{sid}_final.wav"
+                shutil.copy(tts_path, final_path)
+                seg["tts_output_path"] = final_path
+                seg["speed_adjusted"] = False
+                seg["video_slow_factor"] = round(speed_factor, 4)
+                seg["speed_factor"] = round(speed_factor, 4)
+                continue
+            else:
+                log.info(f"Seg {sid}: ses uzun ({tts_dur:.2f}s > {seg_dur:.2f}s), hızlandırılıyor (speed_factor={speed_factor:.3f})")
+                force_omnivoice = speed_factor > max_speed_factor
 
         if not force_omnivoice:
             fast_path  = f"{tmp}/tts_{sid}_fast.wav"
@@ -1282,11 +1375,24 @@ def step8_assemble_video(
                 dur = get_audio_duration(seg_path)
             except Exception:
                 dur = seg.get("duration", 1.0)
-                
-            out_st = max(0.0, dur - 0.02)
+
+            # Ardışık segmentler arası boşluk kontrolü
+            prev_end = valid_segs[i - 1]["start"] + valid_segs[i - 1].get("duration", 1.0) if i > 0 else -1.0
+            next_start = valid_segs[i + 1]["start"] if i < len(valid_segs) - 1 else 9999.0
+            gap_before = seg["start"] - prev_end
+            gap_after = next_start - (seg["start"] + dur)
+
+            # Sadece gerçek boşluk varsa fade uygula (click önleme: 2ms)
+            fade_parts = []
+            if gap_before > 0.15 or i == 0:
+                fade_parts.append("afade=t=in:ss=0:d=0.002")
+            out_st = max(0.0, dur - 0.002)
+            if gap_after > 0.15 or i == len(valid_segs) - 1:
+                fade_parts.append(f"afade=t=out:st={out_st:.3f}:d=0.002")
+
+            fade_str = ",".join(fade_parts) + "," if fade_parts else ""
             inputs  += f"-i {q(seg_path)} "
-            # Pop/Click seslerini önlemek için başa ve sona 20ms fade ekliyoruz
-            filters.append(f"[{i+1}]afade=t=in:ss=0:d=0.02,afade=t=out:st={out_st:.3f}:d=0.02,adelay={delay_ms}|{delay_ms}[s{i}]")
+            filters.append(f"[{i+1}]{fade_str}adelay={delay_ms}|{delay_ms}[s{i}]")
             mix_ins += f"[s{i}]"
 
         n_inputs = len(valid_segs) + 1  # base + segmentler
@@ -1322,6 +1428,239 @@ def step8_assemble_video(
     )
 
     log.info(f"Video tamamlandı: {output_path}")
+    return output_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADIM 8-ALT — VIDEO YAVAŞLATMA MODUNDA BİRLEŞTİRME
+# ══════════════════════════════════════════════════════════════════════════════
+
+def step8_assemble_video_slow(
+    segments: list,
+    video_path: str,
+    bg_path: str,
+    tmp: str,
+    output_path: str,
+    vocal_volume: float = 0.9,
+    bg_volume: float = 1.0,
+) -> str:
+    """
+    slow_video modu: video_slow_factor > 1.0 olan segmentlerde videoyu yavaşlatır.
+
+    Tek FFmpeg geçişi ile trim + setpts + concat filter kullanır.
+    Dosya kesme/birleştirme yapılmaz → kesme artefaktları oluşmaz.
+    """
+    log.info("=" * 60)
+    log.info("ADIM 8 — Video birleştirme (SLOW VIDEO MODU — tek geçiş)")
+
+    video_dur = get_video_duration(video_path)
+
+    # ── 1. Yavaşlatılacak segmentleri belirle ve sırala
+    slow_segs = sorted(
+        [s for s in segments if s.get("video_slow_factor", 1.0) > 1.01],
+        key=lambda s: s["start"]
+    )
+
+    if not slow_segs:
+        log.info("Yavaşlatılacak segment yok, normal birleştirme kullanılıyor.")
+        return step8_assemble_video(
+            segments, video_path, bg_path, tmp, output_path,
+            vocal_volume, bg_volume,
+        )
+
+    log.info(f"{len(slow_segs)} segment için video yavaşlatılacak.")
+
+    # ── 2. Zaman aralıklarını oluştur: (start, end, factor)
+    time_ranges = []
+    current_time = 0.0
+
+    for sseg in slow_segs:
+        seg_start = sseg["start"]
+        seg_end = sseg["end"]
+        factor = sseg["video_slow_factor"]
+
+        # Normal bölüm (önceki parçadan bu segmente kadar)
+        if seg_start > current_time + 0.02:
+            time_ranges.append((current_time, seg_start, 1.0))
+
+        # Yavaşlatılmış bölüm
+        time_ranges.append((seg_start, seg_end, factor))
+        current_time = seg_end
+
+    # Son normal bölüm
+    if current_time < video_dur - 0.02:
+        time_ranges.append((current_time, video_dur, 1.0))
+
+    log.info(f"  Toplam {len(time_ranges)} zaman aralığı oluşturuldu.")
+
+    # ── 3. Tek geçişli FFmpeg filter_complex oluştur
+    video_filters = []
+    audio_filters = []
+    concat_v_labels = []
+    concat_a_labels = []
+
+    for i, (start, end, factor) in enumerate(time_ranges):
+        # Video: trim → setpts
+        if factor == 1.0:
+            video_filters.append(
+                f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{i}]"
+            )
+        else:
+            video_filters.append(
+                f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts={factor:.4f}*(PTS-STARTPTS)[v{i}]"
+            )
+
+        # Audio: atrim → asetpts (+ atempo for slow parts)
+        if factor == 1.0:
+            audio_filters.append(
+                f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{i}]"
+            )
+        else:
+            inv_factor = 1.0 / factor
+            atempo_chain = get_atempo_filter(inv_factor)
+            audio_filters.append(
+                f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,{atempo_chain}[a{i}]"
+            )
+
+        concat_v_labels.append(f"[v{i}]")
+        concat_a_labels.append(f"[a{i}]")
+
+    # Concat filter
+    n = len(time_ranges)
+    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
+    concat_filter = f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+
+    full_filter = ";".join(video_filters + audio_filters) + ";" + concat_filter
+
+    # Filter script dosyasına yaz (çok uzun olabilir)
+    filter_script = f"{tmp}/slow_video_filter.txt"
+    Path(filter_script).write_text(full_filter, encoding="utf-8")
+
+    # ── 4. Tek geçişte video oluştur
+    concat_video = f"{tmp}/concat_video_slow.mp4"
+    run(
+        f'ffmpeg -y -i {q(video_path)} '
+        f'-filter_complex_script {q(filter_script)} '
+        f'-map "[outv]" -map "[outa]" '
+        f'-c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k '
+        f'{q(concat_video)}',
+        "single-pass slow video"
+    )
+
+    total_new_dur = get_video_duration(concat_video)
+    log.info(f"Yeni video süresi: {total_new_dur:.2f}s (orijinal: {video_dur:.2f}s)")
+
+    # ── 5. Zaman eşleme tablosu oluştur
+    time_mapping = []
+    new_time = 0.0
+    for start, end, factor in time_ranges:
+        orig_dur = end - start
+        new_dur = orig_dur * factor
+        time_mapping.append((start, end, new_time, new_time + new_dur, factor))
+        new_time += new_dur
+
+    def map_time(orig_t):
+        """Orijinal zamandan yeni zamana dönüştür."""
+        for orig_s, orig_e, new_s, new_e, sf in time_mapping:
+            if orig_s <= orig_t <= orig_e:
+                ratio = (orig_t - orig_s) / max(orig_e - orig_s, 0.001)
+                return new_s + ratio * (new_e - new_s)
+        return orig_t * (total_new_dur / video_dur)
+
+    # ── 6. TTS seslerini yeni zaman çizelgesine göre yerleştir
+    silent_base = f"{tmp}/silent_base_slow.wav"
+    run(
+        f'ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono '
+        f'-t {total_new_dur:.3f} {q(silent_base)}',
+        "silent base slow"
+    )
+
+    valid_segs = [
+        s for s in segments
+        if s.get("tts_output_path") and Path(s["tts_output_path"]).exists()
+    ]
+
+    if not valid_segs:
+        dubbed_vocals = silent_base
+    else:
+        inputs = f"-i {q(silent_base)} "
+        filters = []
+        mix_ins = "[0]"
+
+        for i, seg in enumerate(valid_segs):
+            new_start = map_time(seg["start"])
+            delay_ms = int(new_start * 1000)
+            seg_path = seg["tts_output_path"]
+            try:
+                dur = get_audio_duration(seg_path)
+            except Exception:
+                dur = seg.get("duration", 1.0)
+
+            # Ardışık segmentler arası boşluk kontrolü
+            prev_end = map_time(valid_segs[i - 1]["start"]) + valid_segs[i - 1].get("duration", 1.0) if i > 0 else -1.0
+            next_start_mapped = map_time(valid_segs[i + 1]["start"]) if i < len(valid_segs) - 1 else 9999.0
+            gap_before = new_start - prev_end
+            gap_after = next_start_mapped - (new_start + dur)
+
+            fade_parts = []
+            if gap_before > 0.15 or i == 0:
+                fade_parts.append("afade=t=in:ss=0:d=0.002")
+            out_st = max(0.0, dur - 0.002)
+            if gap_after > 0.15 or i == len(valid_segs) - 1:
+                fade_parts.append(f"afade=t=out:st={out_st:.3f}:d=0.002")
+
+            fade_str = ",".join(fade_parts) + "," if fade_parts else ""
+            inputs += f"-i {q(seg_path)} "
+            filters.append(f"[{i+1}]{fade_str}adelay={delay_ms}|{delay_ms}[s{i}]")
+            mix_ins += f"[s{i}]"
+
+        n_inputs = len(valid_segs) + 1
+        filter_str = ";".join(filters)
+        filter_str += f";{mix_ins}amix=inputs={n_inputs}:duration=first:normalize=0[dubbed]"
+
+        filter_script_path = f"{tmp}/filter_script_slow.txt"
+        Path(filter_script_path).write_text(filter_str, encoding="utf-8")
+
+        dubbed_vocals = f"{tmp}/dubbed_vocals_slow.wav"
+        run(
+            f'ffmpeg -y {inputs} '
+            f'-filter_complex_script {q(filter_script_path)} '
+            f'-map "[dubbed]" {q(dubbed_vocals)}',
+            "dubbed vocals assembly slow"
+        )
+
+    # ── 7. Arka plan sesini de yeni süreye uzat
+    bg_stretched = f"{tmp}/bg_stretched.wav"
+    bg_dur = get_audio_duration(bg_path)
+    if total_new_dur > bg_dur + 0.1:
+        pad_dur = total_new_dur - bg_dur
+        run(
+            f'ffmpeg -y -i {q(bg_path)} '
+            f'-af "apad=pad_dur={pad_dur:.3f}" {q(bg_stretched)}',
+            "stretch bg audio"
+        )
+    else:
+        shutil.copy(bg_path, bg_stretched)
+
+    # ── 8. Arka plan + dublajlı vokal miksleme
+    final_audio = f"{tmp}/final_audio_slow.wav"
+    run(
+        f'ffmpeg -y -i {q(bg_stretched)} -i {q(dubbed_vocals)} '
+        f'-filter_complex "[0][1]amix=inputs=2:duration=first:weights={bg_volume} {vocal_volume}[mix]" '
+        f'-map "[mix]" {q(final_audio)}',
+        "audio mix slow"
+    )
+
+    # ── 9. Video + ses birleştir
+    run(
+        f'ffmpeg -y -i {q(concat_video)} -i {q(final_audio)} '
+        f'-c:v copy -c:a aac -b:a 192k '
+        f'-map 0:v:0 -map 1:a:0 -shortest {q(output_path)}',
+        "final video slow"
+    )
+
+    log.info(f"Video tamamlandı (slow mode): {output_path}")
+    log.info(f"Toplam süre: {total_new_dur:.2f}s (orijinal: {video_dur:.2f}s, fark: +{total_new_dur - video_dur:.2f}s)")
     return output_path
 
 
@@ -1509,15 +1848,15 @@ def main():
     parser.add_argument("--target_language_id",   required=True,  help="OmniVoice dil kodu (ör: tr)")
     parser.add_argument("--source_language",      default="auto",
                         help="Whisper kaynak dil kodu (ör: en, de, fr). 'auto' = otomatik algıla")
-    parser.add_argument("--lm_studio_url",        default="http://localhost:1234/v1",
-                        help="LM Studio API endpoint")
-    parser.add_argument("--lm_studio_model",      default="local-model",
-                        help="LM Studio'da yüklenecek model adı (ör: aya-23-8b)")
+    parser.add_argument("--lm_studio_url",        default="http://localhost:11434/v1",
+                        help="Ollama OpenAI-compatible API endpoint (ör: http://localhost:11434/v1)")
+    parser.add_argument("--lm_studio_model",      default="gemma4:e2b",
+                        help="Kullanılacak model adı (varsayılan: gemma4:e2b)")
     parser.add_argument("--whisper_model",        default="large-v3",
                         help="Whisper modeli (tiny, base, small, medium, large-v3)")
     # GUI geriye uyumluluk — bu argümanlar kabul edilir ama dahili olarak kullanılmaz
-    parser.add_argument("--translation_api",      default="lm_studio",
-                        help="(Geriye uyumluluk) Çeviri her zaman LM Studio üzerinden yapılır")
+    parser.add_argument("--translation_api",      default="ollama",
+                        help="(Geriye uyumluluk) Çeviri OpenAI-compatible endpoint üzerinden yapılır (örn. Ollama)")
     parser.add_argument("--translation_api_key",  default="",
                         help="(Geriye uyumluluk) Şu an kullanılmıyor")
     parser.add_argument("--omnivoice_model",      default="k2-fsa/OmniVoice")
@@ -1550,6 +1889,12 @@ def main():
                         help="Dublaj ses seviyesi (varsayılan: 0.9)")
     parser.add_argument("--bg_volume",            type=float, default=1.0,
                         help="Arka plan ses seviyesi (varsayılan: 1.0)")
+    parser.add_argument("--slow_video",           action="store_true",
+                        help="Sesi hızlandırmak yerine videoyu yavaşlat (toplam süre uzar)")
+    parser.add_argument("--resume",               action="store_true",
+                        help="Önceki çalışmadan kaldığı yerden devam et (tmp dizini varsa)")
+    parser.add_argument("--merge_speaker_gap",     type=int, default=0,
+                        help="Aynı konuşmacının ardışık segmentlerini birleştirme eşiği (ms). 0=kapalı, ör: 1000=1sn altı boşlukları birleştir")
     args = parser.parse_args()
     
     video_stem = Path(args.video).stem
@@ -1562,7 +1907,7 @@ def main():
     if not args.no_confirm:
         print("\n" + "!" * 60)
         print("  ❓ Süreye sığmayan uzun çeviriler için hangi yöntem kullanılsın?")
-        print("     1: Çeviriyi Kısalt (LM Studio cümleyi özetleyerek kısaltır) [Varsayılan]")
+        print("     1: Çeviriyi Kısalt (LLM cümleyi özetleyerek kısaltır) [Varsayılan]")
         print("     2: Sesi Hızlandır (Çeviri kısaltılmaz, doğal bırakılır, seslendirme sonradan hızlandırılır)")
         secim = input("  Seçiminiz (1/2): ").strip()
         if secim == '2':
@@ -1577,9 +1922,16 @@ def main():
 
     # ── Geçici dizin
     tmp = f"{video_stem}_tmp"
-    if Path(tmp).exists():
-        shutil.rmtree(tmp)
-    Path(tmp).mkdir(parents=True, exist_ok=True)
+    resuming = args.resume and Path(tmp).exists() and Path(f"{tmp}/segments.json").exists()
+
+    if resuming:
+        log.info("🔄 RESUME MODU — Önceki çalışmadan devam ediliyor.")
+        segments = json.loads(Path(f"{tmp}/segments.json").read_text(encoding="utf-8"))
+        log.info(f"  {len(segments)} segment yüklendi.")
+    else:
+        if Path(tmp).exists():
+            shutil.rmtree(tmp)
+        Path(tmp).mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
     log.info("═" * 60)
@@ -1588,82 +1940,136 @@ def main():
     log.info(f"  Hedef dil   : {args.target_language} ({args.target_language_id})")
     log.info(f"  Kaynak dil  : {args.source_language}")
     log.info(f"  Çeviri API  : {args.translation_api}")
-    log.info(f"  LM Studio   : {args.lm_studio_url}")
+    log.info(f"  LLM API     : {args.lm_studio_url} | model={args.lm_studio_model}")
     log.info(f"  OmniVoice   : {args.omnivoice_model} @ {args.omnivoice_device}")
     log.info(f"  Max hız     : {args.max_speed_factor}x | Max kısaltma: {args.max_shortening_ratio:.0%}")
+    log.info(f"  Slow Video  : {'AÇIK' if args.slow_video else 'KAPALI'}")
+    log.info(f"  Resume      : {'AÇIK' if resuming else 'KAPALI'}")
     log.info("═" * 60)
 
+    # ── Checkpoint kontrol fonksiyonu
+    def _check_step_done(step_name, check_fn):
+        """Resume modunda adım tamamlanmış mı kontrol et."""
+        if not resuming:
+            return False
+        done = check_fn()
+        if done:
+            log.info(f"⏭️  {step_name} — zaten tamamlanmış, atlanıyor.")
+        return done
+
     # ADIM 1 — Ses ayırma
-    vocals_path, bg_path = step1_separate_audio(args.video, tmp)
+    vocals_path = f"{tmp}/vocals.wav"
+    bg_path = f"{tmp}/no_vocals.wav"
+    if not _check_step_done("ADIM 1 (Ses ayırma)",
+                            lambda: Path(vocals_path).exists() and Path(bg_path).exists()):
+        vocals_path, bg_path = step1_separate_audio(args.video, tmp)
 
     # ADIM 2 — Transkripsiyon ve Diarization
-    segments = step2_diarize(
-        vocals_path, args.whisper_model, tmp,
-        source_language=args.source_language
-    )
+    if not _check_step_done("ADIM 2 (Transkripsiyon)",
+                            lambda: resuming and segments and segments[0].get("original_text")):
+        segments = step2_diarize(
+            vocals_path, args.whisper_model, tmp,
+            source_language=args.source_language
+        )
+
+    # ADIM 2.5 — Konuşmacı Bloklama
+    if args.merge_speaker_gap > 0:
+        if not _check_step_done("ADIM 2.5 (Konuşmacı Bloklama)",
+                                lambda: resuming and segments and segments[0].get("merged_ids")):
+            segments = step2_5_merge_speakers(segments, args.merge_speaker_gap, tmp)
 
     # ADIM 3 — Referans ses segmentleri (sessizlik kırpmalı)
-    segments = step3_extract_ref_segments(segments, vocals_path, tmp, args.silence_threshold)
-    
+    if not _check_step_done("ADIM 3 (Referans ses)",
+                            lambda: resuming and segments and segments[0].get("ref_audio_path")):
+        segments = step3_extract_ref_segments(segments, vocals_path, tmp, args.silence_threshold)
+
     # ADIM 3.5 — Ses Cinsiyeti ve Özel Atama
-    segments = step3_5_assign_voices(segments, tmp, args.no_confirm)
+    if not _check_step_done("ADIM 3.5 (Ses ataması)",
+                            lambda: resuming and segments and segments[0].get("voice_source")):
+        segments = step3_5_assign_voices(segments, tmp, args.no_confirm)
 
     # ADIM 4 — Çeviri
-    segments = step4_translate(
-        segments, args.target_language,
-        args.lm_studio_url, args.lm_studio_model, tmp,
-        translation_strategy=translation_strategy,
-        chars_per_second=args.chars_per_second,
-        context_size=args.context_size,
-    )
+    if not _check_step_done("ADIM 4 (Çeviri)",
+                            lambda: resuming and segments and segments[0].get("translated_text")):
+        segments = step4_translate(
+            segments, args.target_language,
+            args.lm_studio_url, args.lm_studio_model, tmp,
+            translation_strategy=translation_strategy,
+            chars_per_second=args.chars_per_second,
+            context_size=args.context_size,
+        )
 
     # ADIM 4.5 — TTS Metin Normalizasyonu
-    segments = step4_5_normalize_for_tts(segments, args.target_language_id, tmp)
+    if not _check_step_done("ADIM 4.5 (Normalizasyon)",
+                            lambda: resuming and segments and segments[0].get("pre_tts_normalized")):
+        segments = step4_5_normalize_for_tts(segments, args.target_language_id, tmp)
 
-    # ADIM 6 — TTS + TTS-Geri Bildirimli Süre Döngüsü
-    if not args.no_confirm:
-        print("\n" + "!" * 60)
-        print("  ⚠️  DİKKAT: OmniVoice TTS (Seslendirme) adımına geçiliyor.")
-        print("  GPU RAM'ini boşaltmak için (LM Studio modelini kapatmak vb.) bu aşamada bekleyebilirsiniz.")
-        print("!" * 60)
-        
-        devam = input("  Devam etmek istiyor musunuz? (e/h): ").lower().strip()
-        if devam != 'e':
-            log.info("İşlem kullanıcı tarafından durduruldu.")
-            return
-    else:
-        log.info("TTS adımına otomatik geçiliyor (--no_confirm).")
+    # ADIM 6 — TTS
+    model = None
+    tts_done = _check_step_done("ADIM 6 (TTS)",
+        lambda: resuming and segments and segments[0].get("tts_output_path")
+                and Path(segments[0]["tts_output_path"]).exists())
 
-    segments, model = step6_tts(
-        segments, args.omnivoice_model, args.omnivoice_device,
-        args.target_language_id, tmp,
-        silence_threshold=args.silence_threshold,
-        apply_extra_trim=apply_extra_trim,
-    )
+    if not tts_done:
+        if not args.no_confirm:
+            print("\n" + "!" * 60)
+            print("  ⚠️  DİKKAT: OmniVoice TTS (Seslendirme) adımına geçiliyor.")
+            print("  GPU RAM'ini boşaltmak için (LLM/Ollama modelini kapatmak vb.) bu aşamada bekleyebilirsiniz.")
+            print("!" * 60)
+
+            devam = input("  Devam etmek istiyor musunuz? (e/h): ").lower().strip()
+            if devam != 'e':
+                log.info("İşlem kullanıcı tarafından durduruldu.")
+                return
+        else:
+            log.info("TTS adımına otomatik geçiliyor (--no_confirm).")
+
+        segments, model = step6_tts(
+            segments, args.omnivoice_model, args.omnivoice_device,
+            args.target_language_id, tmp,
+            silence_threshold=args.silence_threshold,
+            apply_extra_trim=apply_extra_trim,
+        )
 
     # ADIM 6.5 — Ton Rengi Dönüşümü (OpenVoice)
-    segments = step6_5_tone_convert(
-        segments, tmp, device=args.omnivoice_device,
-    )
+    if not _check_step_done("ADIM 6.5 (Ton dönüşümü)",
+                            lambda: resuming and not any(s.get("tone_convert") and not s.get("tts_output_path", "").endswith("_tc.wav") for s in segments)):
+        segments = step6_5_tone_convert(
+            segments, tmp, device=args.omnivoice_device,
+        )
 
     # ADIM 7 — Hız ayarı
-    segments = step7_speed_adjust(
-        segments, omnivoice_model=model, tmp=tmp,
-        max_speed_factor=args.max_speed_factor,
-        max_shortening_ratio=args.max_shortening_ratio,
-        silence_threshold=args.silence_threshold,
-    )
+    if not _check_step_done("ADIM 7 (Hız ayarı)",
+        lambda: resuming and segments and any(
+            s.get("speed_adjusted") is not None or s.get("video_slow_factor")
+            for s in segments if s.get("tts_output_path")
+        )):
+        segments = step7_speed_adjust(
+            segments, omnivoice_model=model, tmp=tmp,
+            max_speed_factor=args.max_speed_factor,
+            max_shortening_ratio=args.max_shortening_ratio,
+            silence_threshold=args.silence_threshold,
+            slow_video=args.slow_video,
+        )
 
     # Modelleri bellekten boşalt (Adım 7'den sonra)
-    del model
-    clear_gpu_cache()
+    if model is not None:
+        del model
+        clear_gpu_cache()
 
     # ADIM 8 — Video birleştirme
-    output = step8_assemble_video(
-        segments, args.video, bg_path, tmp, args.output,
-        vocal_volume=args.vocal_volume,
-        bg_volume=args.bg_volume,
-    )
+    if args.slow_video:
+        output = step8_assemble_video_slow(
+            segments, args.video, bg_path, tmp, args.output,
+            vocal_volume=args.vocal_volume,
+            bg_volume=args.bg_volume,
+        )
+    else:
+        output = step8_assemble_video(
+            segments, args.video, bg_path, tmp, args.output,
+            vocal_volume=args.vocal_volume,
+            bg_volume=args.bg_volume,
+        )
 
     # ADIM 8.5 — Debug Senkronizasyon Videosu
     if args.debug_sync:
